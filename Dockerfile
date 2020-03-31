@@ -1,10 +1,16 @@
-# Stage and thin the application 
+# Build application
+FROM maven:3-jdk-11-openj9 as builder
+WORKDIR /home/maven
+COPY . .
+RUN mvn clean package
+
+# Stage and thin the application
 # tag::OLimage1[]
 FROM open-liberty as staging
 # end::OLimage1[]
 
 # tag::copyJar[]
-COPY --chown=1001:0 target/spring-kafka-0.1.0.jar \
+COPY --from=builder --chown=1001:0 /home/maven/target/spring-kafka-0.1.0.jar \
                     /staging/fat-spring-kafka-0.1.0.jar
 # end::copyJar[]
 

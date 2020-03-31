@@ -1,2 +1,7 @@
 target/
 .idea/
+
+release.yaml
+
+chart/*
+!chart/template-*
