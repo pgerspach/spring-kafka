@@ -99,44 +99,6 @@ spec:
             secretKeyRef:
               name: ${secretName}
               key: password
-    - name: buildah
-      image: quay.io/buildah/stable:v1.11.0
-      tty: true
-      command: ["/bin/bash"]
-      workingDir: ${workingDir}
-      securityContext:
-        privileged: true
-      envFrom:
-        - configMapRef:
-            name: ibmcloud-config
-        - secretRef:
-            name: ibmcloud-apikey
-      env:
-        - name: HOME
-          value: /home/devops
-        - name: ENVIRONMENT_NAME
-          value: ${env.NAMESPACE}
-        - name: DOCKERFILE
-          value: ./Dockerfile
-        - name: CONTEXT
-          value: .
-        - name: TLSVERIFY
-          value: "false"
-        - name: REGISTRY_USER
-          valueFrom:
-            secretKeyRef:
-              key: REGISTRY_USER
-              name: ibmcloud-apikey
-              optional: true
-        - name: REGISTRY_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              key: APIKEY
-              name: ibmcloud-apikey
-              optional: true
-      volumeMounts:
-        - mountPath: /var/lib/containers
-          name: varlibcontainers
     - name: ibmcloud
       image: docker.io/garagecatalyst/ibmcloud-dev:1.0.10
       tty: true
@@ -166,18 +128,6 @@ spec:
           value: ${namespace}
         - name: BUILD_NUMBER
           value: ${env.BUILD_NUMBER}
-    - name: trigger-cd
-      image: docker.io/garagecatalyst/ibmcloud-dev:1.0.10
-      tty: true
-      command: ["/bin/bash"]
-      workingDir: ${workingDir}
-      env:
-        - name: HOME
-          value: /home/devops
-      envFrom:
-        - secretRef:
-            name: gitops-cd-secret
-            optional: true
 """
 ) {
     node(buildLabel) {
@@ -185,12 +135,12 @@ spec:
             checkout scm
             stage('Build') {
                 sh '''
-                    mvn package
+                    ./mvnw package
                 '''
             }
             stage('Test') {
                 sh '''#!/bin/bash
-                    mvn test
+                    ./mvnw test
                 '''
             }
         }
@@ -231,26 +181,25 @@ spec:
                 '''
             }
         }
-	      container(name: 'buildah', shell: '/bin/bash') {
+        container(name: 'ibmcloud', shell: '/bin/bash') {
             stage('Build image') {
                 sh '''#!/bin/bash
-                    set -e
                     . ./env-config
 
-		    echo TLSVERIFY=${TLSVERIFY}
-		    echo CONTEXT=${CONTEXT}
-
-                    APP_IMAGE="${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
-
-                    buildah bud --tls-verify=${TLSVERIFY} --format=docker -f ${DOCKERFILE} -t ${APP_IMAGE} ${CONTEXT}
-                    if [[ -n "${REGISTRY_USER}" ]] && [[ -n "${REGISTRY_PASSWORD}" ]]; then
-                        buildah login -u "${REGISTRY_USER}" -p "${REGISTRY_PASSWORD}" "${REGISTRY_URL}"
+                    echo -e "=========================================================================================="
+                    echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
+                    set -x
+                    ibmcloud cr build -t ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION} .
+                    if [[ $? -ne 0 ]]; then
+                      exit 1
                     fi
-                    buildah push --tls-verify=${TLSVERIFY} "${APP_IMAGE}" "docker://${APP_IMAGE}"
+
+                    if [[ -n "${BUILD_NUMBER}" ]]; then
+                        echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}-${BUILD_NUMBER}"
+                        ibmcloud cr image-tag ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION} ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}-${BUILD_NUMBER}
+                    fi
                 '''
             }
-        }
-        container(name: 'ibmcloud', shell: '/bin/bash') {
             stage('Deploy to DEV env') {
                 sh '''#!/bin/bash
                     . ./env-config
@@ -332,99 +281,6 @@ spec:
                         exit 1
                     fi
 
-                '''
-            }
-            stage('Package Helm Chart') {
-                sh '''#!/bin/bash
-
-                if [[ -z "${ARTIFACTORY_URL}" ]]; then
-                  echo "Skipping Artifactory step as Artifactory is not installed or configured"
-                  exit 0
-                fi
-
-                . ./env-config
-
-                if [[ -z "${ARTIFACTORY_ENCRYPT}" ]]; then
-                    echo "Encrption key not available for Jenkins pipeline, please add it to the artifactory-access"
-                    exit 1
-                fi
-
-                export URL=$(curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD} -X GET "${ARTIFACTORY_URL}/artifactory/api/repositories?type=LOCAL" | jq '.[0].url' | tr -d \\")
-                echo ${URL}
-
-                # Check if the URL is valid and we can continue
-                if [ -n "${URL}" ]; then
-                    echo "Successfully read Repo ${URL}"
-                else
-                    echo "No Repository Created"
-                    exit 1;
-                fi;
-
-                # Package Helm Chart
-                helm package --version ${IMAGE_VERSION} ${CHART_ROOT}/${IMAGE_NAME}
-
-                # Get the index and re index it with current Helm Chart
-                curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRYPT} -O "${URL}/${REGISTRY_NAMESPACE}/index.yaml"
-
-                if [[ $(cat index.yaml | jq '.errors[0].status') != "404" ]]; then
-                    # Merge the chart index with the current index.yaml held in Artifactory
-                    echo "Merging Chart into index.yaml for Chart Repository"
-                    helm repo index . --url ${URL}/${REGISTRY_NAMESPACE} --merge index.yaml
-                else
-                    # Dont Merge this is first time one is being created
-                    echo "Creating a new index.yaml for Chart Repository"
-                    rm index.yaml
-                    helm repo index . --url ${URL}/${REGISTRY_NAMESPACE}
-                fi;
-
-                # Persist the Helm Chart in Artifactory for us by ArgoCD
-                curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRYPT} -i -vvv -T ${IMAGE_NAME}-${IMAGE_VERSION}.tgz "${URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}-${IMAGE_VERSION}.tgz"
-
-                # Persist the Helm Chart in Artifactory for us by ArgoCD
-                curl -u${ARTIFACTORY_USER}:${ARTIFACTORY_ENCRYPT} -i -vvv -T index.yaml "${URL}/${REGISTRY_NAMESPACE}/index.yaml"
-
-            '''
-            }
-        }
-        container(name: 'trigger-cd', shell: '/bin/bash') {
-            stage('Trigger CD Pipeline') {
-                sh '''#!/bin/bash
-                    if [[ -z "${url}" ]]; then
-                        echo "'url' not set. Not triggering CD pipeline"
-                        exit 0
-                    fi
-                    if [[ -z "${host}" ]]; then
-                        echo "'host' not set. Not triggering CD pipeline"
-                        exit 0
-                    fi
-
-                    if [[ -z "${branch}" ]]; then
-                        branch="master"
-                    fi
-
-                    . ./env-config
-
-                    # This email is not used and is not valid, you can ignore but git requires it
-                    git config --global user.email "jenkins@ibmcloud.com"
-                    git config --global user.name "Jenkins Pipeline"
-
-                    GIT_URL="https://${username}:${password}@${host}/${org}/${repo}"
-
-                    git clone -b ${branch} ${GIT_URL} gitops_cd
-                    cd gitops_cd
-
-                    echo "Requirements before update"
-                    cat "./${IMAGE_NAME}/requirements.yaml"
-
-                    npm i -g @garage-catalyst/ibm-garage-cloud-cli
-                    igc yq w ./${IMAGE_NAME}/requirements.yaml "dependencies[?(@.name == '${IMAGE_NAME}')].version" ${IMAGE_VERSION} -i
-
-                    echo "Requirements after update"
-                    cat "./${IMAGE_NAME}/requirements.yaml"
-
-                    git add -u
-                    git commit -m "Updates ${IMAGE_NAME} to ${IMAGE_VERSION}"
-                    git push -v
                 '''
             }
         }
