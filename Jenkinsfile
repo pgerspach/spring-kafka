@@ -185,7 +185,7 @@ spec:
             stage('Build image') {
                 sh '''#!/bin/bash
                     . ./env-config
-
+                    ibmcloud login -u $REGISTRY_USER -p $APIKEY
                     echo -e "=========================================================================================="
                     echo -e "BUILDING CONTAINER IMAGE: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_VERSION}"
                     set -x
